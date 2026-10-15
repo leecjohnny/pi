@@ -659,6 +659,7 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 |---|---|---|
 | Memory | `MemoryStorage` from the package root | Nothing is persisted. |
 | SQLite | `openNodeSqliteStorage(file)` from `@earendil-works/pi-durable/storage/sqlite/node` | One database file. WAL mode with `synchronous = NORMAL`: commits survive process crashes; the newest may be lost on power or host failure. |
+| PostgreSQL | `PostgresStorage.open(sql)` from `@earendil-works/pi-durable/storage/postgres` | Owns a dedicated Postgres.js client and one database schema. Migrations run on open. |
 | JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. Keeps the whole history in memory too, so memory grows with it; use SQLite for long-running agents. |
 | Cloudflare Durable Object | `openDurableObjectSqliteStorage(ctx.storage)` from `@earendil-works/pi-durable/storage/sqlite/cloudflare` | The SQLite storage of one SQLite-backed Durable Object; commits are its storage transactions. |
 
@@ -671,6 +672,17 @@ await database.transaction(async (transaction) => {
 	await transaction.exec("CREATE TABLE example (value TEXT)");
 	await transaction.run("INSERT INTO example (value) VALUES (?)", "stored atomically");
 });
+```
+
+PostgreSQL uses a caller-provisioned schema (or a dedicated database's default schema). Give each store its own client and only one owning Session. `close()` drains admitted operations and closes the pool. Configure TLS and pooling through Postgres.js:
+
+```typescript
+import postgres from "postgres";
+import { PostgresStorage } from "@earendil-works/pi-durable/storage/postgres";
+
+const sql = postgres(databaseUrl, { connection: { search_path: "my_session" } });
+const storage = await PostgresStorage.open(sql);
+const harness = await Harness.open(storage, { models, registry }, context);
 ```
 
 Custom backends can run the shared conformance suite with any Vitest- or Jest-compatible runner:
