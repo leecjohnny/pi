@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { AgentDoc } from "@earendil-works/pi-durable";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { describe, expect, it } from "vitest";
 import { idFromNumber } from "../src/ids.ts";
@@ -19,6 +20,7 @@ import type {
 	TaskRecord,
 } from "../src/types.ts";
 import { ROOT_CONVERSATION_ID } from "../src/types.ts";
+import { openHarness } from "./harness-support.ts";
 import { createPostgresDatabase } from "./postgres-fixture.ts";
 import { ReopeningStorage } from "./reopening-storage.ts";
 
@@ -29,18 +31,71 @@ async function createPostgresStorage() {
 	return { ...database, storage: await database.open() };
 }
 
-registerStorageConformance({ describe, expect, it }, "PostgresStorage", async (use) =>
-	use((await createPostgresStorage()).storage),
-);
-registerStorageConformance({ describe, expect, it }, "PostgresStorage across reopen", async (use) => {
-	const database = await createPostgresDatabase();
-	const storage = new ReopeningStorage(await database.open(), database.open);
-	try {
-		await use(storage);
-	} finally {
-		await storage.close(context);
+for (const scoped of [false, true]) {
+	for (const reopen of [false, true]) {
+		const name = `PostgresStorage ${scoped ? "scoped" : "default"}${reopen ? " across reopen" : ""}`;
+		registerStorageConformance({ describe, expect, it }, name, async (use) => {
+			const database = await createPostgresDatabase();
+			const backend = scoped ? await database.openBackend() : undefined;
+			const open = backend === undefined ? database.open : () => backend.openStore("session-under-test");
+			const neighbor = backend === undefined ? undefined : await backend.openStore("neighbor-session");
+			if (neighbor !== undefined) await seedNeighbor(neighbor);
+			const initial = await open();
+			const storage = reopen ? new ReopeningStorage(initial, open) : initial;
+			try {
+				await use(storage);
+				if (neighbor !== undefined) {
+					expect((await neighbor.document(idFromNumber<DocumentId>(5), "current", context))?.value).toEqual({
+						text: "neighbor",
+					});
+					expect((await neighbor.task(idFromNumber<TaskId<JsonValue>>(3), context))?.background).toBe(false);
+					expect((await neighbor.submission(idFromNumber<SubmissionId>(4), context))?.status).toBe("queued");
+				}
+			} finally {
+				await storage.close(context);
+			}
+		});
 	}
-});
+}
+
+async function seedNeighbor(storage: Storage): Promise<void> {
+	await createRoot(storage);
+	await storage.commit(
+		[
+			{
+				type: "conversation",
+				value: {
+					id: idFromNumber<ConversationId>(6),
+					parent: { conversationId: ROOT_CONVERSATION_ID, at: idFromNumber<EntryId>(2) },
+				},
+			},
+			{
+				type: "entry",
+				value: {
+					...entry(idFromNumber<EntryId>(2), ROOT_CONVERSATION_ID, "neighbor"),
+					head: idFromNumber<EntryId>(2),
+				},
+			},
+			{ type: "task", value: pendingTask(idFromNumber<TaskId<JsonValue>>(3)) },
+			{
+				type: "submission",
+				value: {
+					id: idFromNumber<SubmissionId>(4),
+					conversationId: ROOT_CONVERSATION_ID,
+					requestId: "request-1",
+					type: "input",
+					status: "queued",
+				},
+			},
+			{
+				type: "document.create",
+				record: { id: idFromNumber<DocumentId>(5), kind: "neighbor", scope: { kind: "session" } },
+				content: { kind: "base", version: 1, value: { text: "neighbor" } },
+			},
+		],
+		context,
+	);
+}
 
 function entry(id: EntryId, conversationId: ConversationId, data?: JsonValue): EntryRecord {
 	return { id, conversationId, kind: "message", ...(data === undefined ? {} : { data }) };
@@ -87,6 +142,7 @@ describe("PostgresStorage persistence and queries", () => {
 
 	it("rejects persisted metadata corruption on reopen", async () => {
 		const { storage, sql, open } = await createPostgresStorage();
+		await createRoot(storage);
 		await storage.close(context);
 		await sql`DELETE FROM durable_metadata`;
 		await expect(open()).rejects.toThrow("Durable PostgreSQL metadata is missing");
@@ -426,6 +482,79 @@ describe("PostgresStorage persistence and queries", () => {
 		} finally {
 			await writer`ROLLBACK`;
 			writer.release();
+		}
+	});
+});
+
+describe("PostgreSQL Harness scope", () => {
+	it.each([false, true])("resumes native Harness state in scoped mode %s", async (scoped) => {
+		const database = await createPostgresDatabase();
+		const backend = scoped ? await database.openBackend() : undefined;
+		const open = backend === undefined ? database.open : () => backend.openStore("user/session-a");
+		let { harness } = await openHarness(await open());
+		try {
+			const root = await harness.root(context, { agent: { cwd: "/session-a" } });
+			const submission = await root.submit(
+				{ type: "write", requestId: "same-request", entry: { kind: "note", data: "session-a" } },
+				context,
+			);
+			await submission.wait(context);
+			const fork = await root.fork(
+				(await submission.status(context)).entry!,
+				{ ownership: { kind: "ownerless" } },
+				context,
+			);
+			await harness.close(context);
+			harness = (await openHarness(await open())).harness;
+			const resumed = await harness.root(context, { init: () => expect.unreachable() });
+			expect(resumed.id).toBe(ROOT_CONVERSATION_ID);
+			expect(
+				(await resumed.submit({ type: "write", requestId: "same-request", entry: { kind: "ignored" } }, context))
+					.id,
+			).toBe(submission.id);
+			expect(await harness.snapshot(AgentDoc, resumed.id, context)).toMatchObject({ cwd: "/session-a" });
+			expect(
+				(await (await harness.conversation(fork.id, context))!.entries({}, 10, undefined, context)).items,
+			).toMatchObject([{ kind: "note", data: "session-a" }]);
+		} finally {
+			await harness.close(context);
+		}
+	});
+
+	it("isolates colliding native IDs, histories, documents and requests while sharing a pool", async () => {
+		const database = await createPostgresDatabase();
+		const backend = await database.openBackend();
+		const a = (await openHarness(await backend.openStore("user-a/session"))).harness;
+		const b = (await openHarness(await backend.openStore("user-b/session"))).harness;
+		try {
+			const roots = await Promise.all([
+				a.root(context, { agent: { cwd: "/a" } }),
+				b.root(context, { agent: { cwd: "/b" } }),
+			]);
+			expect(roots.map((root) => root.id)).toEqual([ROOT_CONVERSATION_ID, ROOT_CONVERSATION_ID]);
+			const submissions = await Promise.all(
+				roots.map((root, index) =>
+					root.submit({ type: "write", requestId: "same-request", entry: { kind: "note", data: index } }, context),
+				),
+			);
+			await Promise.all(submissions.map((submission) => submission.wait(context)));
+			expect(submissions[0]!.id).toBe(submissions[1]!.id);
+			for (const [index, harness] of [a, b].entries()) {
+				expect(await harness.snapshot(AgentDoc, ROOT_CONVERSATION_ID, context)).toMatchObject({
+					cwd: index === 0 ? "/a" : "/b",
+				});
+				expect((await roots[index]!.entries({}, 1, undefined, context)).items).toMatchObject([
+					{ kind: "note", data: index },
+				]);
+			}
+			await a.close(context);
+			const next = await roots[1]!.submit({ type: "write", entry: { kind: "note", data: "still-open" } }, context);
+			await next.wait(context);
+			expect((await roots[1]!.entries({}, 1, undefined, context)).items).toMatchObject([{ data: "still-open" }]);
+			await backend.close();
+			await expect(backend.openStore("user-c/session")).rejects.toThrow("PostgresBackend is closed");
+		} finally {
+			await Promise.all([a.close(context), b.close(context)]);
 		}
 	});
 });

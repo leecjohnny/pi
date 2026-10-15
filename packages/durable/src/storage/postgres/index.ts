@@ -4,4 +4,4 @@ export {
 	POSTGRES_MIGRATIONS,
 	type PostgresMigration,
 } from "./migrations.ts";
-export { PostgresStorage } from "./storage.ts";
+export { type PostgresBackend, PostgresStorage } from "./storage.ts";

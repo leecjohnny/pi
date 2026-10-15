@@ -18,7 +18,7 @@ describe("durable PostgreSQL migrations", () => {
 		expect((await database`SELECT version FROM durable_schema WHERE singleton = 1`)[0]).toEqual({
 			version: String(CURRENT_POSTGRES_SCHEMA_VERSION),
 		});
-		expect((await database`SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1`)[0]).toEqual({
+		expect((await database`SELECT next_id, next_seq FROM durable_metadata WHERE store_id = 'default'`)[0]).toEqual({
 			next_id: "2",
 			next_seq: "1",
 		});
@@ -121,7 +121,7 @@ describe("durable PostgreSQL migrations", () => {
 			},
 			commit_seq: "1",
 		});
-		expect((await database`SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1`)[0]).toEqual({
+		expect((await database`SELECT next_id, next_seq FROM durable_metadata WHERE store_id = 'default'`)[0]).toEqual({
 			next_id: "3",
 			next_seq: "2",
 		});

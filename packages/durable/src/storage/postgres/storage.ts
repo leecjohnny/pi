@@ -1,4 +1,5 @@
 import type { Context, JsonValue } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { apply, type Op } from "@earendil-works/chord/delta";
 import type postgres from "postgres";
 import { StorageRequestError } from "../../errors.ts";
@@ -112,25 +113,46 @@ const isAliveAt = (record: DocumentRecord, at: DocumentPoint): boolean => {
 const isCurrentOnly = (record: DocumentRecord): boolean =>
 	record.scope.kind !== "conversation" || record.history === "latest";
 
-/** PostgreSQL implementation of native Storage. Owns its dedicated Postgres.js client. */
+/** One migrated schema and pool, shared by independent native stores. */
+export interface PostgresBackend {
+	openStore(storeId: string): Promise<PostgresStorage>;
+	close(): Promise<void>;
+}
+
+/** PostgreSQL implementation of native Storage, bound to one store. */
 export class PostgresStorage implements Storage {
 	private readonly sql: postgres.Sql;
+	private readonly storeId: string;
+	private readonly release: () => void;
+	private ownsPool = false;
 	private closed = false;
 	private closing: Promise<void> | undefined;
 	private active = 0;
 	private drained: (() => void) | undefined;
 
-	private constructor(sql: postgres.Sql) {
+	private constructor(sql: postgres.Sql, storeId: string, release: () => void) {
 		this.sql = sql;
+		this.storeId = storeId;
+		this.release = release;
 	}
 
-	/** Migrate an inactive store. One schema belongs to one owning Session. */
+	/** Open the default store, taking ownership of its dedicated pool. */
 	static async open(sql: postgres.Sql): Promise<PostgresStorage> {
+		const backend = await PostgresStorage.openBackend(sql);
+		try {
+			const storage = await backend.openStore("default");
+			storage.ownsPool = true;
+			return storage;
+		} catch (error) {
+			await backend.close();
+			throw error;
+		}
+	}
+
+	/** Migrate an inactive backend. The host ensures one owning Session per store ID. */
+	static async openBackend(sql: postgres.Sql): Promise<PostgresBackend> {
 		try {
 			await applyPostgresMigrations(sql);
-			const [metadata] = await sql`SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1`;
-			if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
-			return new PostgresStorage(sql);
 		} catch (error) {
 			try {
 				await sql.end();
@@ -139,6 +161,40 @@ export class PostgresStorage implements Storage {
 			}
 			throw error;
 		}
+		const stores = new Set<PostgresStorage>();
+		let closed = false;
+		let closing: Promise<void> | undefined;
+		return {
+			async openStore(storeId) {
+				if (closed) throw new Error("PostgresBackend is closed");
+				const storage = new PostgresStorage(sql, storeId, () => stores.delete(storage));
+				stores.add(storage);
+				try {
+					await storage.admit(async () => {
+						await sql`INSERT INTO durable_metadata (store_id, next_id, next_seq)
+							SELECT ${storeId}, 2, 1 WHERE NOT EXISTS (SELECT 1 FROM record_ids WHERE store_id = ${storeId})
+							ON CONFLICT (store_id) DO NOTHING`;
+						const [metadata] =
+							await sql`SELECT next_id, next_seq FROM durable_metadata WHERE store_id = ${storeId}`;
+						if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
+					});
+					return storage;
+				} catch (error) {
+					await storage.close(BACKGROUND_CONTEXT);
+					throw error;
+				}
+			},
+			close() {
+				if (closing === undefined) {
+					closed = true;
+					closing = (async () => {
+						await Promise.all([...stores].map((store) => store.close(BACKGROUND_CONTEXT)));
+						await sql.end();
+					})();
+				}
+				return closing;
+			},
+		};
 	}
 
 	commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
@@ -146,21 +202,21 @@ export class PostgresStorage implements Storage {
 			const actions = this.prepareDocumentActions(writes);
 			return this.sql.begin(async (sql) => {
 				const [metadata] = await sql<{ next_seq: string }[]>`
-					SELECT next_seq FROM durable_metadata WHERE singleton = 1`;
+					SELECT next_seq FROM durable_metadata WHERE store_id = ${this.storeId}`;
 				if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
 				const seq = seqFromNumber(Number(metadata.next_seq));
 				const claimed = await this.checkGlobalIds(sql, writes);
 				await this.checkDocumentActions(sql, actions);
-				const claims = [...claimed].map(([id, record_type]) => ({ id, record_type }));
-				for (const batch of batches(claims, 2)) {
-					await sql`INSERT INTO record_ids ${sql(batch, "id", "record_type")} ON CONFLICT DO NOTHING`;
+				const claims = [...claimed].map(([id, record_type]) => ({ store_id: this.storeId, id, record_type }));
+				for (const batch of batches(claims, 3)) {
+					await sql`INSERT INTO record_ids ${sql(batch, "store_id", "id", "record_type")} ON CONFLICT DO NOTHING`;
 				}
 				await this.applyTableWrites(sql, writes, seq);
 				await this.applyDocumentActions(sql, actions, seq);
 				let nextId = 2;
 				for (const id of claimed.keys()) nextId = Math.max(nextId, id + 1);
 				await sql`UPDATE durable_metadata SET next_seq = ${seq + 1},
-					next_id = GREATEST(next_id, ${nextId}::bigint) WHERE singleton = 1`;
+					next_id = GREATEST(next_id, ${nextId}::bigint) WHERE store_id = ${this.storeId}`;
 				return seq;
 			});
 		});
@@ -169,7 +225,7 @@ export class PostgresStorage implements Storage {
 	mintId<I extends Id<string>>(): Promise<I> {
 		return this.admit(async () => {
 			const [row] = await this.sql<{ id: string }[]>`UPDATE durable_metadata SET next_id = next_id + 1
-				WHERE singleton = 1 AND next_id <= ${Number.MAX_SAFE_INTEGER}::bigint RETURNING next_id - 1 AS id`;
+				WHERE store_id = ${this.storeId} AND next_id <= ${Number.MAX_SAFE_INTEGER}::bigint RETURNING next_id - 1 AS id`;
 			if (row === undefined) throw new Error("ID space is exhausted");
 			return idFromNumber<I>(Number(row.id));
 		});
@@ -179,7 +235,7 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const [row] = await this.sql<
 				{ record: ConversationRecord }[]
-			>`SELECT record FROM conversations WHERE id = ${id}`;
+			>`SELECT record FROM conversations WHERE store_id = ${this.storeId} AND id = ${id}`;
 			return row?.record;
 		});
 	}
@@ -194,7 +250,7 @@ export class PostgresStorage implements Storage {
 			const sql = this.sql;
 			const start = scanStart(query.order, cursor, "ascending");
 			const rows = await sql<{ record: ConversationRecord }[]>`SELECT record FROM conversations
-				WHERE ${scanCondition(sql, start.after, start.order)}
+				WHERE store_id = ${this.storeId} AND ${scanCondition(sql, start.after, start.order)}
 				${query.ownerConversationId === undefined ? sql`` : sql`AND owner_conversation_id = ${query.ownerConversationId}`}
 				${query.ownerTaskId === undefined ? sql`` : sql`AND owner_task_id = ${query.ownerTaskId}`}
 				ORDER BY id ${direction(sql, start.order)} LIMIT ${limit + 1}`;
@@ -228,7 +284,7 @@ export class PostgresStorage implements Storage {
 			const lineage =
 				context === undefined ? undefined : await this.ancestry(idFromNumber<ConversationId>(idOrConversationId));
 			const [row] = await this.sql<{ record: EntryRecord; commit_seq: string }[]>`
-				SELECT record, commit_seq FROM entries WHERE id = ${id}`;
+				SELECT record, commit_seq FROM entries WHERE store_id = ${this.storeId} AND id = ${id}`;
 			if (row === undefined) return undefined;
 			if (
 				lineage !== undefined &&
@@ -249,7 +305,7 @@ export class PostgresStorage implements Storage {
 			const sql = this.sql;
 			const branches = ancestors.map(
 				(part) => sql`(SELECT record, id, ${part.depth}::integer AS depth
-				FROM entries WHERE conversation_id = ${part.id}::bigint AND head IS NOT NULL
+				FROM entries WHERE store_id = ${this.storeId} AND conversation_id = ${part.id}::bigint AND head IS NOT NULL
 				AND id <= ${Math.min(Number(part.upper_id), atOrBeforeEntryId ?? Number.MAX_SAFE_INTEGER)}::bigint
 				ORDER BY id DESC LIMIT 1)`,
 			);
@@ -272,7 +328,7 @@ export class PostgresStorage implements Storage {
 			// Concrete conversation bounds let each branch use the conversation index even with skewed histories.
 			const branches = ancestors.map(
 				(part) => sql`(SELECT record, id, ${part.depth}::integer AS depth
-				FROM entries WHERE conversation_id = ${part.id}::bigint
+				FROM entries WHERE store_id = ${this.storeId} AND conversation_id = ${part.id}::bigint
 				AND id <= ${Math.min(Number(part.upper_id), query.maxEntryId ?? Number.MAX_SAFE_INTEGER)}::bigint
 				${query.minEntryId === undefined ? sql`` : sql`AND id >= ${query.minEntryId}`}
 				AND ${scanCondition(sql, start.after, start.order)}
@@ -292,11 +348,11 @@ export class PostgresStorage implements Storage {
 	private async ancestry(id: ConversationId): Promise<readonly Ancestor[]> {
 		const ancestors = await this.sql<Ancestor[]>`WITH RECURSIVE lineage AS (
 			SELECT id, record, 0 AS depth, ${Number.MAX_SAFE_INTEGER}::bigint AS upper_id
-			FROM conversations WHERE id = ${id}
+			FROM conversations WHERE store_id = ${this.storeId} AND id = ${id}
 			UNION ALL
 			SELECT parent.id, parent.record, child.depth + 1,
 				LEAST(child.upper_id, (child.record->'parent'->>'at')::bigint)
-			FROM lineage child JOIN conversations parent ON parent.id = (child.record->'parent'->>'conversationId')::bigint
+			FROM lineage child JOIN conversations parent ON parent.store_id = ${this.storeId} AND parent.id = (child.record->'parent'->>'conversationId')::bigint
 		) SELECT id, depth, upper_id FROM lineage ORDER BY depth`;
 		if (ancestors.length === 0) throw new StorageRequestError(`Unknown conversation: ${id}`);
 		return ancestors;
@@ -304,7 +360,9 @@ export class PostgresStorage implements Storage {
 
 	task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
 		return this.admit(async () => {
-			const [row] = await this.sql<{ record: StoredTask }[]>`SELECT record FROM tasks WHERE id = ${id}`;
+			const [row] = await this.sql<
+				{ record: StoredTask }[]
+			>`SELECT record FROM tasks WHERE store_id = ${this.storeId} AND id = ${id}`;
 			return row?.record;
 		});
 	}
@@ -320,7 +378,7 @@ export class PostgresStorage implements Storage {
 			const start = scanStart(query.order, cursor, "ascending");
 			const kind = query.kind === undefined ? undefined : encodeIndexedString(query.kind);
 			const rows = await sql<{ record: StoredTask }[]>`SELECT record FROM tasks
-				WHERE ${scanCondition(sql, start.after, start.order)}
+				WHERE store_id = ${this.storeId} AND ${scanCondition(sql, start.after, start.order)}
 				${query.conversationId === undefined ? sql`` : sql`AND conversation_id = ${query.conversationId}`}
 				${kind === undefined ? sql`` : sql`AND md5(kind) = md5(${kind}) AND kind = ${kind}`}
 				${query.status === undefined ? sql`` : sql`AND status = ${query.status}`}
@@ -337,7 +395,9 @@ export class PostgresStorage implements Storage {
 
 	submission(id: SubmissionId, _context: Context): Promise<SubmissionRecord | undefined> {
 		return this.admit(async () => {
-			const [row] = await this.sql<{ record: SubmissionRecord }[]>`SELECT record FROM submissions WHERE id = ${id}`;
+			const [row] = await this.sql<
+				{ record: SubmissionRecord }[]
+			>`SELECT record FROM submissions WHERE store_id = ${this.storeId} AND id = ${id}`;
 			return row?.record;
 		});
 	}
@@ -352,7 +412,7 @@ export class PostgresStorage implements Storage {
 			const sql = this.sql;
 			const start = scanStart(query.order, cursor, "ascending");
 			const rows = await sql<{ record: SubmissionRecord }[]>`SELECT record FROM submissions
-				WHERE ${scanCondition(sql, start.after, start.order)}
+				WHERE store_id = ${this.storeId} AND ${scanCondition(sql, start.after, start.order)}
 				${query.conversationId === undefined ? sql`` : sql`AND conversation_id = ${query.conversationId}`}
 				${query.status === undefined ? sql`` : sql`AND status = ${query.status}`}
 				ORDER BY id ${direction(sql, start.order)} LIMIT ${limit + 1}`;
@@ -372,7 +432,7 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const encoded = encodeIndexedString(requestId);
 			const [row] = await this.sql<{ record: SubmissionRecord }[]>`SELECT record FROM submissions
-				WHERE conversation_id = ${conversationId} AND md5(request_id) = md5(${encoded}) AND request_id = ${encoded} LIMIT 1`;
+				WHERE store_id = ${this.storeId} AND conversation_id = ${conversationId} AND md5(request_id) = md5(${encoded}) AND request_id = ${encoded} LIMIT 1`;
 			return row?.record;
 		});
 	}
@@ -381,7 +441,7 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const sql = this.sql;
 			const [row] = await sql<{ record: DocumentRecord }[]>`SELECT record FROM documents
-				WHERE ${addressCondition(sql, address)} AND ${lifetimeCondition(sql, at)} ORDER BY created_at DESC LIMIT 1`;
+				WHERE store_id = ${this.storeId} AND ${addressCondition(sql, address)} AND ${lifetimeCondition(sql, at)} ORDER BY created_at DESC LIMIT 1`;
 			return row?.record;
 		});
 	}
@@ -403,7 +463,7 @@ export class PostgresStorage implements Storage {
 			const scope = scopeColumns(query.scope);
 			const kind = query.kind === undefined ? undefined : encodeIndexedString(query.kind);
 			const rows = await sql<{ record: DocumentRecord }[]>`SELECT record FROM documents
-				WHERE scope_kind = ${scope.scopeKind} AND owner_id = ${scope.ownerId} AND id > ${cursorId(cursor) ?? -1}
+				WHERE store_id = ${this.storeId} AND scope_kind = ${scope.scopeKind} AND owner_id = ${scope.ownerId} AND id > ${cursorId(cursor) ?? -1}
 				${kind === undefined ? sql`` : sql`AND md5(kind) = md5(${kind}) AND kind = ${kind}`}
 				AND ${lifetimeCondition(sql, query.at)} ORDER BY id LIMIT ${limit + 1}`;
 			return page(
@@ -426,10 +486,11 @@ export class PostgresStorage implements Storage {
 			await new Promise<void>((resolve) => {
 				this.drained = resolve;
 			});
-		await this.sql.end();
+		this.release();
+		if (this.ownsPool) await this.sql.end();
 	}
 
-	/** Track whole operations, including later queries, before ending the owned pool. */
+	/** Track whole operations, including later queries, before releasing the handle or ending its owned pool. */
 	private async admit<T>(operation: () => Promise<T>): Promise<T> {
 		if (this.closed) throw new Error("PostgresStorage is closed");
 		this.active++;
@@ -445,7 +506,9 @@ export class PostgresStorage implements Storage {
 		id: DocumentId,
 		at: DocumentPoint,
 	): Promise<StoredDocument | undefined> {
-		const [row] = await sql<{ record: DocumentRecord }[]>`SELECT record FROM documents WHERE id = ${id}`;
+		const [row] = await sql<
+			{ record: DocumentRecord }[]
+		>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
 		if (row === undefined) return undefined;
 		const record = row.record;
 		if (at !== "current" && isCurrentOnly(record))
@@ -453,11 +516,11 @@ export class PostgresStorage implements Storage {
 		if (!isAliveAt(record, at)) return undefined;
 		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
 		const [base] = await sql<RevisionRow[]>`SELECT seq, kind, version, content FROM document_revisions
-			WHERE document_id = ${id} AND kind = 'base' AND seq <= ${upper} ORDER BY seq DESC LIMIT 1`;
+			WHERE store_id = ${this.storeId} AND document_id = ${id} AND kind = 'base' AND seq <= ${upper} ORDER BY seq DESC LIMIT 1`;
 		if (base === undefined) throw new Error(`Document ${id} is missing a required base`);
 		let value = base.content as JsonObject;
 		const tail = await sql<RevisionRow[]>`SELECT seq, kind, version, content FROM document_revisions
-			WHERE document_id = ${id} AND seq > ${base.seq}::bigint AND seq <= ${upper} ORDER BY seq`;
+			WHERE store_id = ${this.storeId} AND document_id = ${id} AND seq > ${base.seq}::bigint AND seq <= ${upper} ORDER BY seq`;
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version)
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
@@ -479,7 +542,7 @@ export class PostgresStorage implements Storage {
 		const existing = new Map(
 			(
 				await sql<{ id: string; record_type: TableName }[]>`
-			SELECT id, record_type FROM record_ids WHERE id = ANY(${sql.array(ids, 20)})`
+			SELECT id, record_type FROM record_ids WHERE store_id = ${this.storeId} AND id = ANY(${sql.array(ids, 20)})`
 			).map((row) => [Number(row.id), row.record_type]),
 		);
 		for (const write of writes) {
@@ -556,7 +619,9 @@ export class PostgresStorage implements Storage {
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id))
 				throw new Error(`Document copy ${id} source is changed in the copy batch`);
-			const [row] = await sql<{ record: DocumentRecord }[]>`SELECT record FROM documents WHERE id = ${id}`;
+			const [row] = await sql<
+				{ record: DocumentRecord }[]
+			>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
 			const existing = row?.record;
 			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
@@ -564,7 +629,7 @@ export class PostgresStorage implements Storage {
 			if (action.content?.kind === "delta") {
 				const [previous] = await sql<
 					{ version: string }[]
-				>`SELECT version FROM document_revisions WHERE document_id = ${id} ORDER BY seq DESC LIMIT 1`;
+				>`SELECT version FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id} ORDER BY seq DESC LIMIT 1`;
 				if (previous === undefined) throw new Error(`Document ${id} delta has no base`);
 				if (Number(previous.version) !== action.content.version)
 					throw new Error(`Document ${id} version transition requires a base`);
@@ -574,7 +639,7 @@ export class PostgresStorage implements Storage {
 			let live = liveCounts.get(key);
 			if (live === undefined) {
 				const [current] =
-					await sql`SELECT id FROM documents WHERE ${addressCondition(sql, record)} AND retired_at IS NULL LIMIT 1`;
+					await sql`SELECT id FROM documents WHERE store_id = ${this.storeId} AND ${addressCondition(sql, record)} AND retired_at IS NULL LIMIT 1`;
 				live = current === undefined ? 0 : 1;
 			}
 			if (action.retire && existing !== undefined) live--;
@@ -607,27 +672,30 @@ export class PostgresStorage implements Storage {
 					break;
 			}
 		}
-		for (const batch of batches([...conversations.values()], 4)) {
+		for (const batch of batches([...conversations.values()], 5)) {
 			const rows = batch.map((record) => ({
+				store_id: this.storeId,
 				id: record.id,
 				owner_conversation_id: record.owner?.conversationId ?? null,
 				owner_task_id: record.owner?.taskId ?? null,
 				record: sql.typed(record, 114),
 			}));
-			await sql`INSERT INTO conversations ${sql(rows, "id", "owner_conversation_id", "owner_task_id", "record")}`;
+			await sql`INSERT INTO conversations ${sql(rows, "store_id", "id", "owner_conversation_id", "owner_task_id", "record")}`;
 		}
-		for (const batch of batches([...entries.values()], 5)) {
+		for (const batch of batches([...entries.values()], 6)) {
 			const rows = batch.map((record) => ({
+				store_id: this.storeId,
 				id: record.id,
 				conversation_id: record.conversationId,
 				head: record.head ?? null,
 				commit_seq: seq,
 				record: sql.typed(record, 114),
 			}));
-			await sql`INSERT INTO entries ${sql(rows, "id", "conversation_id", "head", "commit_seq", "record")}`;
+			await sql`INSERT INTO entries ${sql(rows, "store_id", "id", "conversation_id", "head", "commit_seq", "record")}`;
 		}
-		for (const batch of batches([...tasks.values()], 7)) {
+		for (const batch of batches([...tasks.values()], 8)) {
 			const rows = batch.map((record) => ({
+				store_id: this.storeId,
 				id: record.id,
 				conversation_id: record.conversationId,
 				kind: encodeIndexedString(record.kind),
@@ -636,20 +704,21 @@ export class PostgresStorage implements Storage {
 				background: record.background,
 				record: sql.typed(record, 114),
 			}));
-			await sql`INSERT INTO tasks ${sql(rows, "id", "conversation_id", "kind", "status", "abort_requested", "background", "record")}
-				ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
+			await sql`INSERT INTO tasks ${sql(rows, "store_id", "id", "conversation_id", "kind", "status", "abort_requested", "background", "record")}
+				ON CONFLICT(store_id, id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
 				status = excluded.status, abort_requested = excluded.abort_requested, background = excluded.background, record = excluded.record`;
 		}
-		for (const batch of batches([...submissions.values()], 5)) {
+		for (const batch of batches([...submissions.values()], 6)) {
 			const rows = batch.map((record) => ({
+				store_id: this.storeId,
 				id: record.id,
 				conversation_id: record.conversationId,
 				request_id: record.requestId === undefined ? null : encodeIndexedString(record.requestId),
 				status: record.status,
 				record: sql.typed(record, 114),
 			}));
-			await sql`INSERT INTO submissions ${sql(rows, "id", "conversation_id", "request_id", "status", "record")}
-				ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
+			await sql`INSERT INTO submissions ${sql(rows, "store_id", "id", "conversation_id", "request_id", "status", "record")}
+				ON CONFLICT(store_id, id) DO UPDATE SET conversation_id = excluded.conversation_id,
 				request_id = excluded.request_id, status = excluded.status, record = excluded.record`;
 		}
 	}
@@ -689,29 +758,31 @@ export class PostgresStorage implements Storage {
 					...(action.retire ? { retiredAt: seq } : {}),
 				};
 				const parts = addressParts(record);
-				await sql`INSERT INTO documents (id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-					VALUES (${id}, ${parts.kind}, ${parts.family}, ${parts.keyValue}, ${parts.scopeKind}, ${parts.ownerId},
+				await sql`INSERT INTO documents (store_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
+					VALUES (${this.storeId}, ${id}, ${parts.kind}, ${parts.family}, ${parts.keyValue}, ${parts.scopeKind}, ${parts.ownerId},
 					${seq}, ${action.retire ? seq : null}, ${sql.typed(record, 114)})`;
 			} else {
-				const [row] = await sql<{ record: DocumentRecord }[]>`SELECT record FROM documents WHERE id = ${id}`;
+				const [row] = await sql<
+					{ record: DocumentRecord }[]
+				>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
 				record = row!.record;
 			}
 
 			if (content !== undefined) {
 				if (content.kind === "base" && isCurrentOnly(record)) {
-					await sql`DELETE FROM document_revisions WHERE document_id = ${id}`;
+					await sql`DELETE FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id}`;
 				}
-				await sql`INSERT INTO document_revisions (document_id, seq, kind, version, content)
-					VALUES (${id}, ${seq}, ${content.kind}, ${content.version}, ${sql.typed(content.kind === "base" ? content.value : content.ops, 114)})`;
+				await sql`INSERT INTO document_revisions (store_id, document_id, seq, kind, version, content)
+					VALUES (${this.storeId}, ${id}, ${seq}, ${content.kind}, ${content.version}, ${sql.typed(content.kind === "base" ? content.value : content.ops, 114)})`;
 			}
 
 			if (action.retire) {
 				if (action.create === undefined) {
 					record = { ...record, retiredAt: seq };
-					await sql`UPDATE documents SET retired_at = ${seq}, record = ${sql.typed(record, 114)} WHERE id = ${id}`;
+					await sql`UPDATE documents SET retired_at = ${seq}, record = ${sql.typed(record, 114)} WHERE store_id = ${this.storeId} AND id = ${id}`;
 				}
 				if (isCurrentOnly(record)) {
-					await sql`DELETE FROM document_revisions WHERE document_id = ${id}`;
+					await sql`DELETE FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id}`;
 				}
 			}
 		}

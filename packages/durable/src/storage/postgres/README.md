@@ -5,12 +5,21 @@ Session and Harness use the same records, document revisions, and query contract
 as the SQLite backend. See the [package guide](../../../README.md#storage) for
 the public import and an example.
 
-One PostgreSQL schema is one store, corresponding to one SQLite database file.
-The caller provisions that schema and passes a dedicated client with its
-`search_path` set. The host must ensure that only one Session writes to the store.
-`open()` applies migrations atomically and takes ownership of the client, including
-closing it on initialization failure. `close()` rejects new operations, waits for
-admitted operations to finish, and then closes the pool.
+Both modes use one schema and the same queries. `PostgresStorage.open(sql)`
+opens the `default` store and owns the client. For several users or sessions,
+`PostgresStorage.openBackend(sql)` migrates once and owns a shared pool.
+`backend.openStore(storeId)` binds an immutable ID to a Storage handle before
+`Harness.open()`. Each native primary key, index, read, write, ID counter, and
+commit sequence is scoped by `store_id`. Native JSON records remain unchanged.
+The application chooses stable store IDs, authorizes access, and ensures one
+owning Session per store. Several sessions for one user can use separate IDs.
+
+Closing a scoped handle rejects new operations and drains its admitted work,
+without closing the shared pool. Closing the backend closes all handles before
+ending the pool. The default store uses the same engine; its close also ends
+the pool. Open handles only after migrations, and migrate an inactive backend.
+New stores start at native ID 2 and sequence 1. Opening an existing store retains
+its counters; missing counters with persisted records are an error.
 
 The schema follows SQLite's native tables: global ID ownership, conversations,
 entries, complete task and submission records, document incarnations, and base
@@ -53,7 +62,9 @@ drops its own schema. From the repository root, run:
 PI_DURABLE_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/pi_storage_test ./test.sh
 ```
 
-The suite runs shared conformance normally and with reopen after every commit,
+The suite runs shared conformance in default and shared-store modes, normally
+and with reopen after every commit. Shared cases run two stores with colliding
+native IDs in the same tables. Harness cases verify isolation and reopen,
 plus SQLite-equivalent persistence, corruption, document reclamation, and atomic
 migration tests. PostgreSQL-specific cases cover durable unused IDs, parameter
 limits, repeated upserts, large identities, consistent reads, and close draining.
