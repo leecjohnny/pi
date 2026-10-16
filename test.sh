@@ -74,6 +74,10 @@ done
 value="${NODE_EXTRA_CA_CERTS-}"
 [[ -z "$value" ]] || test_env+=("NODE_EXTRA_CA_CERTS=$value")
 
+# Explicit test database only; do not inherit application database credentials.
+value="${PI_DURABLE_POSTGRES_URL-}"
+[[ -z "$value" ]] || test_env+=("PI_DURABLE_POSTGRES_URL=$value")
+
 # Preserve CI detection only for runner behavior and test reporting.
 for name in CI GITHUB_ACTIONS; do
 	value="${!name-}"

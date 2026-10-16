@@ -2,27 +2,26 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { afterEach, describe, expect, it } from "vitest";
-import { idFromNumber } from "../src/ids.ts";
 import type { SqliteStorage } from "../src/storage/sqlite/index.ts";
-import { type NodeSqliteStorageOptions, openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import type {
 	ConversationId,
 	DocumentCreate,
 	DocumentId,
 	EntryId,
 	EntryRecord,
-	Id,
 	Seq,
 	Storage,
-	StorageWrite,
 	TaskId,
 	TaskRecord,
 } from "../src/types.ts";
 import { ROOT_CONVERSATION_ID } from "../src/types.ts";
+
+import { ReopeningStorage } from "./reopening-storage.ts";
 
 const context = BACKGROUND_CONTEXT;
 const openStorages = new Set<SqliteStorage>();
@@ -44,72 +43,6 @@ async function createSqliteStorage(options: { readonly walAutoCheckpointPages?: 
 	return { storage, path };
 }
 
-class ReopeningStorage implements Storage {
-	private current: SqliteStorage;
-	private readonly path: string;
-	private readonly options: NodeSqliteStorageOptions;
-	private closed = false;
-
-	constructor(current: SqliteStorage, path: string, options: NodeSqliteStorageOptions = {}) {
-		this.current = current;
-		this.path = path;
-		this.options = options;
-	}
-
-	async commit(writes: readonly StorageWrite[], commitContext: Parameters<Storage["commit"]>[1]): Promise<Seq> {
-		if (this.closed) return this.current.commit(writes, commitContext);
-		try {
-			return await this.current.commit(writes, commitContext);
-		} finally {
-			await this.current.close(context);
-			this.current = await openNodeSqliteStorage(this.path, this.options);
-		}
-	}
-
-	mintId<I extends Id<string>>(): Promise<I> {
-		return this.current.mintId<I>();
-	}
-	conversation: Storage["conversation"] = (id, readContext) => this.current.conversation(id, readContext);
-	scanConversations: Storage["scanConversations"] = (query, limit, cursor, readContext) =>
-		this.current.scanConversations(query, limit, cursor, readContext);
-	entry(id: EntryId, readContext: Context): ReturnType<Storage["entry"]>;
-	entry(conversationId: ConversationId, id: EntryId, readContext: Context): ReturnType<Storage["entry"]>;
-	entry(idOrConversationId: EntryId | ConversationId, idOrContext: EntryId | Context, readContext?: Context) {
-		if (readContext === undefined) {
-			return this.current.entry(idFromNumber<EntryId>(idOrConversationId), idOrContext as Context);
-		}
-		if (typeof idOrContext !== "number") throw new TypeError("Storage.entry() requires an entry ID");
-		return this.current.entry(
-			idFromNumber<ConversationId>(idOrConversationId),
-			idFromNumber<EntryId>(idOrContext),
-			readContext,
-		);
-	}
-	findLatestHeadMarker: Storage["findLatestHeadMarker"] = (conversationId, at, readContext) =>
-		this.current.findLatestHeadMarker(conversationId, at, readContext);
-	scanEntries: Storage["scanEntries"] = (query, limit, cursor, readContext) =>
-		this.current.scanEntries(query, limit, cursor, readContext);
-	task: Storage["task"] = (id, readContext) => this.current.task(id, readContext);
-	scanTasks: Storage["scanTasks"] = (query, limit, cursor, readContext) =>
-		this.current.scanTasks(query, limit, cursor, readContext);
-	submission: Storage["submission"] = (id, readContext) => this.current.submission(id, readContext);
-	scanSubmissions: Storage["scanSubmissions"] = (query, limit, cursor, readContext) =>
-		this.current.scanSubmissions(query, limit, cursor, readContext);
-	submissionByRequest: Storage["submissionByRequest"] = (conversationId, requestId, readContext) =>
-		this.current.submissionByRequest(conversationId, requestId, readContext);
-	findDocument: Storage["findDocument"] = (address, at, readContext) =>
-		this.current.findDocument(address, at, readContext);
-	document: Storage["document"] = (id, at, readContext) => this.current.document(id, at, readContext);
-	scanDocuments: Storage["scanDocuments"] = (query, limit, cursor, readContext) =>
-		this.current.scanDocuments(query, limit, cursor, readContext);
-
-	async close(closeContext: Parameters<Storage["close"]>[0]): Promise<void> {
-		if (this.closed) return;
-		this.closed = true;
-		await this.current.close(closeContext);
-	}
-}
-
 registerStorageConformance({ describe, expect, it }, "SqliteStorage", async (use) =>
 	use((await createSqliteStorage()).storage),
 );
@@ -119,7 +52,7 @@ registerStorageConformance({ describe, expect, it }, "SqliteStorage across reope
 	const path = join(directory, "storage.sqlite");
 	const created = await openNodeSqliteStorage(path);
 	await created.close(context);
-	const storage = new ReopeningStorage(await openNodeSqliteStorage(path), path);
+	const storage = new ReopeningStorage(await openNodeSqliteStorage(path), () => openNodeSqliteStorage(path));
 	try {
 		await use(storage);
 	} finally {
