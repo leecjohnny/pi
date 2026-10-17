@@ -378,13 +378,14 @@ describe("PostgresStorage persistence and queries", () => {
 	it("chunks large commits and keeps the last task and submission replacements", async () => {
 		const { storage } = await createPostgresStorage();
 		await createRoot(storage);
-		const writes: StorageWrite[] = Array.from({ length: 14000 }, (_, i) => ({
+		const entryCount = 22000;
+		const writes: StorageWrite[] = Array.from({ length: entryCount }, (_, i) => ({
 			type: "entry",
 			value: entry(idFromNumber<EntryId>(i + 2), ROOT_CONVERSATION_ID),
 		}));
-		const task = pendingTask(idFromNumber<TaskId<JsonValue>>(14002));
+		const task = pendingTask(idFromNumber<TaskId<JsonValue>>(entryCount + 2));
 		const submission = {
-			id: idFromNumber<SubmissionId>(14003),
+			id: idFromNumber<SubmissionId>(entryCount + 3),
 			conversationId: ROOT_CONVERSATION_ID,
 			type: "input",
 			status: "queued",
@@ -397,15 +398,16 @@ describe("PostgresStorage persistence and queries", () => {
 		);
 		expect(await storage.commit(writes, context)).toBe(2);
 		expect(
-			(await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, 14001, undefined, context)).items,
-		).toHaveLength(14000);
+			(await storage.scanEntries({ conversationId: ROOT_CONVERSATION_ID }, entryCount + 1, undefined, context))
+				.items,
+		).toHaveLength(entryCount);
 		expect(await storage.task(task.id, context)).toEqual({ ...task, background: true });
 		expect(await storage.submission(submission.id, context)).toEqual({
 			...submission,
 			status: "unanswered",
 			reason: "test",
 		});
-		expect(await storage.mintId()).toBe(14004);
+		expect(await storage.mintId()).toBe(entryCount + 4);
 	});
 
 	it("stores and looks up incompressible long identities without B-tree size limits", async () => {
