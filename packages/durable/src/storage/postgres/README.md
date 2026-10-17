@@ -11,6 +11,10 @@ opens the `default` store and owns the client. For several users or sessions,
 `backend.openStore(storeId)` binds an immutable ID to a Storage handle before
 `Harness.open()`. Each native primary key, index, read, write, ID counter, and
 commit sequence is scoped by `store_id`. Native JSON records remain unchanged.
+A data-modifying CTE initializes a store or reads its existing counters in one
+command. It leaves existing metadata unchanged and detects missing counters.
+Backend open reads the schema version first; an already current schema needs
+only reads, with no DDL transaction or schema-write locks.
 The application chooses stable store IDs, authorizes access, and ensures one
 owning Session per store. Several sessions for one user can use separate IDs.
 
@@ -34,25 +38,37 @@ Their text columns use `COLLATE "C"`. Unbounded kinds, keys, and request IDs use
 `md5()` expression indexes so long identities cannot exceed B-tree entry limits.
 Queries always check full encoded equality too; the digest only selects candidates.
 
-Each commit is one transaction. It validates all original global ID claims and
-document commands before applying the batch. ID claims and table writes use
-bounded multi-row inserts. Repeated complete task or submission replacements
-retain the last value after validation. Metadata advances in the same transaction.
+Each commit is one transaction. A [data-modifying CTE](https://www.postgresql.org/docs/18/queries-with.html#QUERIES-WITH-MODIFYING) reserves global IDs and
+reads their previous owners from the same statement snapshot. Validation checks
+every original claim; a failure rolls back the entire transaction. This combines
+the ownership lookup and insert without rewriting existing claim rows.
+Validation loads document metadata and current versions in one query. A new
+document address uses an indexed lookup through
+`unnest` and `LATERAL`; changes to existing content reuse the metadata already
+read. ID claims, document records and revisions use bounded multi-row writes.
+Current-only revision cleanup uses one array-bound delete. Complete task and
+submission replacements retain the last value after validating every original
+ID claim. `UPDATE ... RETURNING` advances metadata atomically with the writes.
 `mintId()` separately advances the durable counter with `UPDATE ... RETURNING`,
-so unused IDs remain consumed after reopen or a failed commit. This costs one
-database command per allocation. There is no commit retry or cross-process lock.
+so unused IDs remain consumed after reopen or a failed commit. The host still
+provides one Session writer per store; this is not a distributed writer lease.
 
-History reads first load immutable ancestor IDs and cumulative fork cutoffs with
-a recursive CTE. A second query uses concrete bounds in separately limited
-`UNION ALL` branches. Each branch can use the conversation index even when most
-entries belong to other conversations. Pages retain native ancestry order and
-cursor semantics. Head queries return the marker, as the Storage contract requires.
+History reads use one recursive CTE for immutable ancestor IDs and cumulative
+fork cutoffs. A limited `LATERAL` index scan reads each ancestor. The final sort
+and limit retain native ancestry order, page bounds and cursor semantics without
+sending ancestry to the application or building a query per branch. Scoped entry
+and head lookups use the same lineage. Every lookup includes `store_id`.
 
-Document reads use a read-only repeatable-read transaction for the incarnation,
-base, and delta tail. Concurrent base replacement or retirement cannot tear those
-reads. Copies use the enclosing commit transaction and the committed source.
-Current-only documents reclaim old revisions at a base or retirement; rewindable
-documents retain their history.
+A document read is one SQL statement joining its incarnation to the latest base
+and bounded revision tail. PostgreSQL's [statement snapshot](https://www.postgresql.org/docs/18/transaction-iso.html#XACT-READ-COMMITTED) keeps the read
+consistent with concurrent replacement or retirement, so a separate read-only
+transaction is unnecessary. Delta replay remains in Chord and preserves native
+JSON values. Copies use the enclosing commit transaction and the committed
+source. Current-only documents reclaim old revisions at a base or retirement;
+rewindable documents retain their history. Schema version 2 adds a partial index
+on `(store_id, scope_kind, owner_id, id)` for non-retired documents. Current scans
+then skip retired incarnations, while historical scans retain their full indexes.
+The migration adds an index and preserves native records and counters.
 
 The PostgreSQL tests require `PI_DURABLE_POSTGRES_URL` pointing to a disposable
 local database where the test user can create schemas. Each case creates and

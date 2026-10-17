@@ -7,7 +7,7 @@ import {
 	POSTGRES_MIGRATIONS,
 	type PostgresMigration,
 } from "../src/storage/postgres/index.ts";
-import { type EntryId, ROOT_CONVERSATION_ID } from "../src/types.ts";
+import { type DocumentId, type EntryId, ROOT_CONVERSATION_ID } from "../src/types.ts";
 import { createPostgresDatabase } from "./postgres-fixture.ts";
 
 describe("durable PostgreSQL migrations", () => {
@@ -22,6 +22,29 @@ describe("durable PostgreSQL migrations", () => {
 			next_id: "2",
 			next_seq: "1",
 		});
+	});
+
+	it("upgrades the first schema while preserving native documents and counters", async () => {
+		const { sql: database, open } = await createPostgresDatabase();
+		await applyPostgresMigrations(database, POSTGRES_MIGRATIONS.slice(0, 1));
+		const record = { id: 2, kind: "retained", scope: { kind: "session" }, createdAt: 1 };
+		await database`INSERT INTO record_ids VALUES ('default', 1, 'conversation'), ('default', 2, 'document')`;
+		await database`INSERT INTO conversations (store_id, id, record) VALUES ('default', 1, ${database.typed({ id: 1 }, 114)})`;
+		await database`INSERT INTO documents (store_id, id, kind, family, key_value, scope_kind, owner_id, created_at, record)
+			VALUES ('default', 2, '"retained"', 0, '""', 'session', 0, 1, ${database.typed(record, 114)})`;
+		await database`INSERT INTO document_revisions VALUES ('default', 2, 1, 'base', 1, ${database.typed({ retained: true }, 114)})`;
+		await database`UPDATE durable_metadata SET next_id = 3, next_seq = 2 WHERE store_id = 'default'`;
+		const storage = await open();
+		expect(await storage.document(idFromNumber<DocumentId>(2), "current", BACKGROUND_CONTEXT)).toMatchObject({
+			record,
+			value: { retained: true },
+			version: 1,
+		});
+		expect(await storage.mintId()).toBe(3);
+		expect(await storage.commit([], BACKGROUND_CONTEXT)).toBe(2);
+		expect((await database`SELECT version FROM durable_schema WHERE singleton = 1`)[0]?.version).toBe(
+			String(CURRENT_POSTGRES_SCHEMA_VERSION),
+		);
 	});
 
 	it("rejects a database newer than the portable core", async () => {

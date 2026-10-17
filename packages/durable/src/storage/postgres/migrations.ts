@@ -97,7 +97,15 @@ const INITIAL_SCHEMA: readonly string[] = [
 ];
 
 /** Immutable, ordered schema history. Append new migrations after the initial schema ships. */
-export const POSTGRES_MIGRATIONS: readonly PostgresMigration[] = [{ version: 1, statements: INITIAL_SCHEMA }];
+export const POSTGRES_MIGRATIONS: readonly PostgresMigration[] = [
+	{ version: 1, statements: INITIAL_SCHEMA },
+	{
+		version: 2,
+		statements: [
+			"CREATE INDEX current_documents_by_scope ON documents (store_id, scope_kind, owner_id, id) WHERE retired_at IS NULL",
+		],
+	},
+];
 
 export const CURRENT_POSTGRES_SCHEMA_VERSION = POSTGRES_MIGRATIONS.at(-1)?.version ?? 0;
 
@@ -114,6 +122,13 @@ export async function applyPostgresMigrations(
 		}
 	}
 
+	const currentVersion = migrations.at(-1)?.version ?? 0;
+	const [schema] = await database<{ present: boolean }[]>`SELECT to_regclass('durable_schema') IS NOT NULL AS present`;
+	if (schema?.present) {
+		const [row] = await database<SchemaRow[]>`SELECT version FROM durable_schema WHERE singleton = 1`;
+		if (row !== undefined && Number(row.version) === currentVersion) return;
+	}
+
 	await database.begin(async (transaction) => {
 		await transaction.unsafe(`CREATE TABLE IF NOT EXISTS durable_schema (
 			singleton BIGINT PRIMARY KEY CHECK (singleton = 1),
@@ -122,7 +137,6 @@ export async function applyPostgresMigrations(
 		await transaction`INSERT INTO durable_schema (singleton, version) VALUES (1, 0) ON CONFLICT DO NOTHING`;
 		const [row] = await transaction<SchemaRow[]>`SELECT version FROM durable_schema WHERE singleton = 1`;
 		if (row === undefined) throw new Error("Durable PostgreSQL schema metadata is missing");
-		const currentVersion = migrations.at(-1)?.version ?? 0;
 		if (Number(row.version) > currentVersion) {
 			throw new Error(
 				`Durable PostgreSQL schema version ${row.version} is newer than supported version ${currentVersion}`,
