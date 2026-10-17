@@ -45,7 +45,11 @@ type RevisionRow = {
 	readonly version: string;
 	readonly content: JsonObject | readonly Op[];
 };
-type Ancestor = { readonly id: string; readonly depth: number; readonly upper_id: string };
+type DocumentRow = { readonly record: DocumentRecord } & (
+	| RevisionRow
+	| { readonly seq: null; readonly kind: null; readonly version: null; readonly content: null }
+);
+type DocumentMetadata = { readonly record: DocumentRecord; readonly version: string | null };
 
 type DocumentAction = {
 	create?: DocumentCreate;
@@ -171,11 +175,12 @@ export class PostgresStorage implements Storage {
 				stores.add(storage);
 				try {
 					await storage.admit(async () => {
-						await sql`INSERT INTO durable_metadata (store_id, next_id, next_seq)
+						const [metadata] = await sql`WITH initialized AS (
+							INSERT INTO durable_metadata (store_id, next_id, next_seq)
 							SELECT ${storeId}, 2, 1 WHERE NOT EXISTS (SELECT 1 FROM record_ids WHERE store_id = ${storeId})
-							ON CONFLICT (store_id) DO NOTHING`;
-						const [metadata] =
-							await sql`SELECT next_id, next_seq FROM durable_metadata WHERE store_id = ${storeId}`;
+							ON CONFLICT (store_id) DO NOTHING RETURNING next_id, next_seq
+						) SELECT next_id, next_seq FROM initialized
+						UNION ALL SELECT next_id, next_seq FROM durable_metadata WHERE store_id = ${storeId}`;
 						if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
 					});
 					return storage;
@@ -201,22 +206,17 @@ export class PostgresStorage implements Storage {
 		return this.admit(async () => {
 			const actions = this.prepareDocumentActions(writes);
 			return this.sql.begin(async (sql) => {
-				const [metadata] = await sql<{ next_seq: string }[]>`
-					SELECT next_seq FROM durable_metadata WHERE store_id = ${this.storeId}`;
-				if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
-				const seq = seqFromNumber(Number(metadata.next_seq));
-				const claimed = await this.checkGlobalIds(sql, writes);
-				await this.checkDocumentActions(sql, actions);
-				const claims = [...claimed].map(([id, record_type]) => ({ store_id: this.storeId, id, record_type }));
-				for (const batch of batches(claims, 3)) {
-					await sql`INSERT INTO record_ids ${sql(batch, "store_id", "id", "record_type")} ON CONFLICT DO NOTHING`;
-				}
-				await this.applyTableWrites(sql, writes, seq);
-				await this.applyDocumentActions(sql, actions, seq);
+				const claimed = await this.claimGlobalIds(sql, writes);
+				const documents = await this.checkDocumentActions(sql, actions);
 				let nextId = 2;
 				for (const id of claimed.keys()) nextId = Math.max(nextId, id + 1);
-				await sql`UPDATE durable_metadata SET next_seq = ${seq + 1},
-					next_id = GREATEST(next_id, ${nextId}::bigint) WHERE store_id = ${this.storeId}`;
+				const [metadata] = await sql<{ seq: string }[]>`UPDATE durable_metadata
+					SET next_seq = next_seq + 1, next_id = GREATEST(next_id, ${nextId}::bigint)
+					WHERE store_id = ${this.storeId} RETURNING next_seq - 1 AS seq`;
+				if (metadata === undefined) throw new Error("Durable PostgreSQL metadata is missing");
+				const seq = seqFromNumber(Number(metadata.seq));
+				await this.applyTableWrites(sql, writes, seq);
+				await this.applyDocumentActions(sql, actions, documents, seq);
 				return seq;
 			});
 		});
@@ -281,17 +281,19 @@ export class PostgresStorage implements Storage {
 						? idFromNumber<EntryId>(idOrContext)
 						: undefined;
 			if (id === undefined) throw new StorageRequestError("Storage.entry() requires an entry ID");
-			const lineage =
-				context === undefined ? undefined : await this.ancestry(idFromNumber<ConversationId>(idOrConversationId));
-			const [row] = await this.sql<{ record: EntryRecord; commit_seq: string }[]>`
-				SELECT record, commit_seq FROM entries WHERE store_id = ${this.storeId} AND id = ${id}`;
-			if (row === undefined) return undefined;
-			if (
-				lineage !== undefined &&
-				!lineage.some((part) => Number(part.id) === row.record.conversationId && id <= Number(part.upper_id))
-			)
-				return undefined;
-			return { entry: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) };
+			const sql = this.sql;
+			const conversationId = context === undefined ? undefined : idFromNumber<ConversationId>(idOrConversationId);
+			const [row] =
+				conversationId === undefined
+					? await sql<{ record: EntryRecord | null; commit_seq: string }[]>`
+					SELECT record, commit_seq FROM entries WHERE store_id = ${this.storeId} AND id = ${id}`
+					: await sql<{ record: EntryRecord | null; commit_seq: string }[]>`${this.lineage(conversationId)}
+					SELECT entry.record, entry.commit_seq FROM entries entry JOIN lineage
+					ON entry.conversation_id = lineage.id AND entry.id <= lineage.upper_id
+					WHERE entry.store_id = ${this.storeId} AND entry.id = ${id}
+					UNION ALL SELECT NULL::json, NULL::bigint WHERE NOT EXISTS (SELECT 1 FROM lineage)`;
+			if (row?.record === null) throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
+			return row === undefined ? undefined : { entry: row.record, commitSeq: seqFromNumber(Number(row.commit_seq)) };
 		});
 	}
 
@@ -301,16 +303,19 @@ export class PostgresStorage implements Storage {
 		_context: Context,
 	): Promise<(EntryRecord & { readonly head: EntryId }) | undefined> {
 		return this.admit(async () => {
-			const ancestors = await this.ancestry(conversationId);
 			const sql = this.sql;
-			const branches = ancestors.map(
-				(part) => sql`(SELECT record, id, ${part.depth}::integer AS depth
-				FROM entries WHERE store_id = ${this.storeId} AND conversation_id = ${part.id}::bigint AND head IS NOT NULL
-				AND id <= ${Math.min(Number(part.upper_id), atOrBeforeEntryId ?? Number.MAX_SAFE_INTEGER)}::bigint
-				ORDER BY id DESC LIMIT 1)`,
-			);
-			const [row] = await sql<{ record: EntryRecord & { readonly head: EntryId } }[]>`
-				SELECT record FROM (${union(sql, branches)}) visible ORDER BY depth, id DESC LIMIT 1`;
+			const [row] = await sql<
+				{ record: (EntryRecord & { readonly head: EntryId }) | null }[]
+			>`${this.lineage(conversationId)}
+				SELECT record FROM (
+					SELECT heads.record, lineage.depth, heads.id FROM lineage CROSS JOIN LATERAL (
+						SELECT record, id FROM entries WHERE store_id = ${this.storeId} AND conversation_id = lineage.id
+						AND head IS NOT NULL AND id <= LEAST(lineage.upper_id, ${atOrBeforeEntryId ?? Number.MAX_SAFE_INTEGER}::bigint)
+						ORDER BY id DESC LIMIT 1
+					) heads
+					UNION ALL SELECT NULL::json, 0, NULL::bigint WHERE NOT EXISTS (SELECT 1 FROM lineage)
+				) visible ORDER BY depth, id DESC LIMIT 1`;
+			if (row?.record === null) throw new StorageRequestError(`Unknown conversation: ${conversationId}`);
 			return row?.record;
 		});
 	}
@@ -323,39 +328,38 @@ export class PostgresStorage implements Storage {
 	): Promise<Page<EntryRecord, Cursor>> {
 		return this.admit(async () => {
 			const start = scanStart(query.order, cursor, "descending");
-			const ancestors = await this.ancestry(query.conversationId);
 			const sql = this.sql;
-			// Concrete conversation bounds let each branch use the conversation index even with skewed histories.
-			const branches = ancestors.map(
-				(part) => sql`(SELECT record, id, ${part.depth}::integer AS depth
-				FROM entries WHERE store_id = ${this.storeId} AND conversation_id = ${part.id}::bigint
-				AND id <= ${Math.min(Number(part.upper_id), query.maxEntryId ?? Number.MAX_SAFE_INTEGER)}::bigint
-				${query.minEntryId === undefined ? sql`` : sql`AND id >= ${query.minEntryId}`}
-				AND ${scanCondition(sql, start.after, start.order)}
-				ORDER BY id ${direction(sql, start.order)} LIMIT ${limit + 1})`,
-			);
-			const rows = await sql<{ record: EntryRecord }[]>`SELECT record FROM (${union(sql, branches)}) visible
-				ORDER BY depth ${direction(sql, start.order === "ascending" ? "descending" : "ascending")},
-				id ${direction(sql, start.order)} LIMIT ${limit + 1}`;
+			const rows = await sql<{ record: EntryRecord | null }[]>`${this.lineage(query.conversationId)}
+				SELECT record FROM (
+					SELECT entries.record, lineage.depth, entries.id FROM lineage CROSS JOIN LATERAL (
+						SELECT record, id FROM entries WHERE store_id = ${this.storeId} AND conversation_id = lineage.id
+						AND id <= LEAST(lineage.upper_id, ${query.maxEntryId ?? Number.MAX_SAFE_INTEGER}::bigint)
+						${query.minEntryId === undefined ? sql`` : sql`AND id >= ${query.minEntryId}`}
+						AND ${scanCondition(sql, start.after, start.order)}
+						ORDER BY id ${direction(sql, start.order)} LIMIT ${limit + 1}
+					) entries
+					UNION ALL SELECT NULL::json, 0, NULL::bigint WHERE NOT EXISTS (SELECT 1 FROM lineage)
+				) visible ORDER BY depth ${direction(sql, start.order === "ascending" ? "descending" : "ascending")},
+					id ${direction(sql, start.order)} LIMIT ${limit + 1}`;
+			if (rows[0]?.record === null) throw new StorageRequestError(`Unknown conversation: ${query.conversationId}`);
 			return page(
-				rows.map((row) => row.record),
+				rows.map((row) => row.record!),
 				limit,
 				start.order,
 			);
 		});
 	}
 
-	private async ancestry(id: ConversationId): Promise<readonly Ancestor[]> {
-		const ancestors = await this.sql<Ancestor[]>`WITH RECURSIVE lineage AS (
+	private lineage(id: ConversationId) {
+		const sql = this.sql;
+		return sql`WITH RECURSIVE lineage AS (
 			SELECT id, record, 0 AS depth, ${Number.MAX_SAFE_INTEGER}::bigint AS upper_id
 			FROM conversations WHERE store_id = ${this.storeId} AND id = ${id}
 			UNION ALL
 			SELECT parent.id, parent.record, child.depth + 1,
 				LEAST(child.upper_id, (child.record->'parent'->>'at')::bigint)
 			FROM lineage child JOIN conversations parent ON parent.store_id = ${this.storeId} AND parent.id = (child.record->'parent'->>'conversationId')::bigint
-		) SELECT id, depth, upper_id FROM lineage ORDER BY depth`;
-		if (ancestors.length === 0) throw new StorageRequestError(`Unknown conversation: ${id}`);
-		return ancestors;
+		)`;
 	}
 
 	task(id: TaskId, _context: Context): Promise<StoredTask | undefined> {
@@ -447,9 +451,7 @@ export class PostgresStorage implements Storage {
 	}
 
 	document(id: DocumentId, at: DocumentPoint, _context: Context): Promise<StoredDocument | undefined> {
-		return this.admit(() =>
-			this.sql.begin("isolation level repeatable read read only", (sql) => this.materializeDocument(sql, id, at)),
-		);
+		return this.admit(() => this.materializeDocument(this.sql, id, at));
 	}
 
 	scanDocuments(
@@ -506,21 +508,23 @@ export class PostgresStorage implements Storage {
 		id: DocumentId,
 		at: DocumentPoint,
 	): Promise<StoredDocument | undefined> {
-		const [row] = await sql<
-			{ record: DocumentRecord }[]
-		>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
-		if (row === undefined) return undefined;
-		const record = row.record;
+		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
+		const [base, ...tail] = await sql<DocumentRow[]>`SELECT document.record, revision.seq,
+			revision.kind, revision.version, revision.content FROM documents document
+			LEFT JOIN document_revisions revision ON revision.store_id = document.store_id AND revision.document_id = document.id
+				AND ${lifetimeCondition(sql, at)}
+				AND revision.seq >= (SELECT seq FROM document_revisions
+					WHERE store_id = document.store_id AND document_id = document.id AND kind = 'base' AND seq <= ${upper}
+					ORDER BY seq DESC LIMIT 1)
+				AND revision.seq <= ${upper}
+			WHERE document.store_id = ${this.storeId} AND document.id = ${id} ORDER BY revision.seq`;
+		if (base === undefined) return undefined;
+		const record = base.record;
 		if (at !== "current" && isCurrentOnly(record))
 			throw new StorageRequestError(`Document ${id} does not retain historical content`);
 		if (!isAliveAt(record, at)) return undefined;
-		const upper = at === "current" ? Number.MAX_SAFE_INTEGER : at;
-		const [base] = await sql<RevisionRow[]>`SELECT seq, kind, version, content FROM document_revisions
-			WHERE store_id = ${this.storeId} AND document_id = ${id} AND kind = 'base' AND seq <= ${upper} ORDER BY seq DESC LIMIT 1`;
-		if (base === undefined) throw new Error(`Document ${id} is missing a required base`);
+		if (base.seq === null) throw new Error(`Document ${id} is missing a required base`);
 		let value = base.content as JsonObject;
-		const tail = await sql<RevisionRow[]>`SELECT seq, kind, version, content FROM document_revisions
-			WHERE store_id = ${this.storeId} AND document_id = ${id} AND seq > ${base.seq}::bigint AND seq <= ${upper} ORDER BY seq`;
 		for (const revision of tail) {
 			if (revision.kind !== "delta" || revision.version !== base.version)
 				throw new Error(`Document ${id} crosses a stored version boundary without a base`);
@@ -529,27 +533,31 @@ export class PostgresStorage implements Storage {
 		return { record, version: Number(base.version), value, deltasSinceBase: tail.length };
 	}
 
-	private async checkGlobalIds(
+	private async claimGlobalIds(
 		sql: postgres.ISql,
 		writes: readonly StorageWrite[],
 	): Promise<Map<Id<string>, TableName>> {
+		const requested = writes.flatMap<{ id: Id<string>; record_type: TableName }>((write) => {
+			if (write.type === "document.change" || write.type === "document.retire") return [];
+			return write.type === "document.create" || write.type === "document.copy"
+				? [{ id: write.record.id, record_type: "document" }]
+				: [{ id: write.value.id, record_type: write.type }];
+		});
+		const rows = [...new Map(requested.map((row) => [row.id, { store_id: this.storeId, ...row }])).values()];
+		const existing = new Map<number, TableName>();
+		for (const batch of batches(rows, 3)) {
+			// The SELECT sees pre-insert rows; data-modifying CTEs share its statement snapshot.
+			const previous = await sql<{ id: string; record_type: TableName }[]>`WITH claimed AS (
+				INSERT INTO record_ids ${sql(batch, "store_id", "id", "record_type")} ON CONFLICT DO NOTHING
+			) SELECT id, record_type FROM record_ids WHERE store_id = ${this.storeId}
+				AND id = ANY(${sql.array(
+					batch.map((row) => row.id),
+					20,
+				)})`;
+			for (const row of previous) existing.set(Number(row.id), row.record_type);
+		}
 		const claimed = new Map<Id<string>, TableName>();
-		const ids = writes.flatMap((write) =>
-			write.type === "document.change" || write.type === "document.retire"
-				? []
-				: [write.type === "document.create" || write.type === "document.copy" ? write.record.id : write.value.id],
-		);
-		const existing = new Map(
-			(
-				await sql<{ id: string; record_type: TableName }[]>`
-			SELECT id, record_type FROM record_ids WHERE store_id = ${this.storeId} AND id = ANY(${sql.array(ids, 20)})`
-			).map((row) => [Number(row.id), row.record_type]),
-		);
-		for (const write of writes) {
-			if (write.type === "document.change" || write.type === "document.retire") continue;
-			const document = write.type === "document.create" || write.type === "document.copy";
-			const table: TableName = document ? "document" : write.type;
-			const id = document ? write.record.id : write.value.id;
+		for (const { id, record_type: table } of requested) {
 			const owner = existing.get(id);
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
@@ -614,40 +622,75 @@ export class PostgresStorage implements Storage {
 	private async checkDocumentActions(
 		sql: postgres.ISql,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
-	): Promise<void> {
+	): Promise<Map<DocumentId, DocumentMetadata>> {
+		const existing = new Map<DocumentId, DocumentMetadata>();
+		if (actions.size === 0) return existing;
+		const rows = await sql<({ id: string } & DocumentMetadata)[]>`SELECT document.id, document.record,
+			(SELECT version FROM document_revisions WHERE store_id = document.store_id AND document_id = document.id
+				ORDER BY seq DESC LIMIT 1) AS version
+			FROM documents document WHERE store_id = ${this.storeId} AND id = ANY(${sql.array([...actions.keys()], 20)})`;
 		const liveCounts = new Map<string, number>();
+		for (const row of rows) {
+			existing.set(idFromNumber<DocumentId>(Number(row.id)), row);
+			if (row.record.retiredAt === undefined) liveCounts.set(addressKey(row.record), 1);
+		}
+		const addresses = new Map<string, ReturnType<typeof addressParts>>();
 		for (const [id, action] of actions) {
 			if (action.copy !== undefined && actions.has(action.copy.id))
 				throw new Error(`Document copy ${id} source is changed in the copy batch`);
-			const [row] = await sql<
-				{ record: DocumentRecord }[]
-			>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
-			const existing = row?.record;
-			if (action.create === undefined && existing === undefined) throw new Error(`Unknown document: ${id}`);
-			if (action.create !== undefined && existing !== undefined) throw new Error(`Document ${id} already exists`);
-			if (existing?.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
+			const stored = existing.get(id);
+			if (action.create === undefined && stored === undefined) throw new Error(`Unknown document: ${id}`);
+			if (action.create !== undefined && stored !== undefined) throw new Error(`Document ${id} already exists`);
+			if (stored?.record.retiredAt !== undefined) throw new Error(`Document ${id} is retired`);
 			if (action.content?.kind === "delta") {
-				const [previous] = await sql<
-					{ version: string }[]
-				>`SELECT version FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id} ORDER BY seq DESC LIMIT 1`;
-				if (previous === undefined) throw new Error(`Document ${id} delta has no base`);
-				if (Number(previous.version) !== action.content.version)
+				if (stored?.version == null) throw new Error(`Document ${id} delta has no base`);
+				if (Number(stored.version) !== action.content.version)
 					throw new Error(`Document ${id} version transition requires a base`);
 			}
-			const record = action.create ?? existing!;
-			const key = addressKey(record);
-			let live = liveCounts.get(key);
-			if (live === undefined) {
-				const [current] =
-					await sql`SELECT id FROM documents WHERE store_id = ${this.storeId} AND ${addressCondition(sql, record)} AND retired_at IS NULL LIMIT 1`;
-				live = current === undefined ? 0 : 1;
+			if (action.create !== undefined && !action.retire) {
+				const key = addressKey(action.create);
+				if (!liveCounts.has(key)) addresses.set(key, addressParts(action.create));
 			}
-			if (action.retire && existing !== undefined) live--;
+		}
+		if (addresses.size) {
+			const parts = [...addresses.values()];
+			const current = await sql<{ record: DocumentRecord }[]>`SELECT current.record FROM unnest(
+				${sql.array(
+					parts.map((p) => p.kind),
+					25,
+				)}, ${sql.array(
+					parts.map((p) => p.scopeKind),
+					25,
+				)},
+				${sql.array(
+					parts.map((p) => p.ownerId),
+					20,
+				)}, ${sql.array(
+					parts.map((p) => p.family),
+					20,
+				)},
+				${sql.array(
+					parts.map((p) => p.keyValue),
+					25,
+				)}
+			) requested(kind, scope_kind, owner_id, family, key_value) CROSS JOIN LATERAL (
+				SELECT record FROM documents WHERE store_id = ${this.storeId} AND retired_at IS NULL
+				AND md5(kind) = md5(requested.kind) AND kind = requested.kind AND scope_kind = requested.scope_kind
+				AND owner_id = requested.owner_id AND family = requested.family
+				AND md5(key_value) = md5(requested.key_value) AND key_value = requested.key_value LIMIT 1
+			) current`;
+			for (const row of current) liveCounts.set(addressKey(row.record), 1);
+		}
+		for (const [id, action] of actions) {
+			const key = addressKey(action.create ?? existing.get(id)!.record);
+			let live = liveCounts.get(key) ?? 0;
+			if (action.retire && action.create === undefined) live--;
 			if (action.create !== undefined && !action.retire) live++;
 			liveCounts.set(key, live);
 		}
 		for (const live of liveCounts.values())
 			if (live > 1) throw new Error("Document address already has a current incarnation");
+		return existing;
 	}
 
 	private async applyTableWrites(sql: postgres.ISql, writes: readonly StorageWrite[], seq: Seq): Promise<void> {
@@ -726,8 +769,12 @@ export class PostgresStorage implements Storage {
 	private async applyDocumentActions(
 		sql: postgres.ISql,
 		actions: ReadonlyMap<DocumentId, DocumentAction>,
+		existing: ReadonlyMap<DocumentId, DocumentMetadata>,
 		seq: Seq,
 	): Promise<void> {
+		const documents: DocumentRecord[] = [];
+		const revisions = new Map<DocumentId, DocumentContent>();
+		const prune = new Set<DocumentId>();
 		for (const [id, action] of actions) {
 			let content = action.content;
 			if (action.copy !== undefined) {
@@ -742,49 +789,51 @@ export class PostgresStorage implements Storage {
 						stored.record.key !== create.key ||
 						stored.record.history !== create.history ||
 						stored.record.fork !== create.fork
-					) {
+					)
 						throw new Error(`Fork source document ${action.copy.id} does not match the copied record`);
-					}
 					content = { kind: "base", version: stored.version, value: stored.value };
 				} catch (error) {
 					throw new Error(`Document copy ${id} was rejected`, { cause: error });
 				}
 			}
-			let record: DocumentRecord;
-			if (action.create !== undefined) {
-				record = {
-					...action.create,
-					createdAt: seq,
-					...(action.retire ? { retiredAt: seq } : {}),
-				};
+			let record: DocumentRecord =
+				action.create === undefined ? existing.get(id)!.record : { ...action.create, createdAt: seq };
+			if (action.retire) record = { ...record, retiredAt: seq };
+			if (action.create !== undefined || action.retire) documents.push(record);
+			if (isCurrentOnly(record) && (action.retire || content?.kind === "base")) prune.add(id);
+			if (content !== undefined && !(action.retire && isCurrentOnly(record))) revisions.set(id, content);
+		}
+		for (const batch of batches(documents, 10)) {
+			const rows = batch.map((record) => {
 				const parts = addressParts(record);
-				await sql`INSERT INTO documents (store_id, id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
-					VALUES (${this.storeId}, ${id}, ${parts.kind}, ${parts.family}, ${parts.keyValue}, ${parts.scopeKind}, ${parts.ownerId},
-					${seq}, ${action.retire ? seq : null}, ${sql.typed(record, 114)})`;
-			} else {
-				const [row] = await sql<
-					{ record: DocumentRecord }[]
-				>`SELECT record FROM documents WHERE store_id = ${this.storeId} AND id = ${id}`;
-				record = row!.record;
-			}
-
-			if (content !== undefined) {
-				if (content.kind === "base" && isCurrentOnly(record)) {
-					await sql`DELETE FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id}`;
-				}
-				await sql`INSERT INTO document_revisions (store_id, document_id, seq, kind, version, content)
-					VALUES (${this.storeId}, ${id}, ${seq}, ${content.kind}, ${content.version}, ${sql.typed(content.kind === "base" ? content.value : content.ops, 114)})`;
-			}
-
-			if (action.retire) {
-				if (action.create === undefined) {
-					record = { ...record, retiredAt: seq };
-					await sql`UPDATE documents SET retired_at = ${seq}, record = ${sql.typed(record, 114)} WHERE store_id = ${this.storeId} AND id = ${id}`;
-				}
-				if (isCurrentOnly(record)) {
-					await sql`DELETE FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ${id}`;
-				}
-			}
+				return {
+					store_id: this.storeId,
+					id: record.id,
+					kind: parts.kind,
+					family: parts.family,
+					key_value: parts.keyValue,
+					scope_kind: parts.scopeKind,
+					owner_id: parts.ownerId,
+					created_at: record.createdAt,
+					retired_at: record.retiredAt ?? null,
+					record: sql.typed(record, 114),
+				};
+			});
+			await sql`INSERT INTO documents ${sql(rows, "store_id", "id", "kind", "family", "key_value", "scope_kind", "owner_id", "created_at", "retired_at", "record")}
+				ON CONFLICT (store_id, id) DO UPDATE SET retired_at = excluded.retired_at, record = excluded.record`;
+		}
+		if (prune.size)
+			await sql`DELETE FROM document_revisions WHERE store_id = ${this.storeId} AND document_id = ANY(${sql.array([...prune], 20)})`;
+		for (const batch of batches([...revisions], 6)) {
+			const rows = batch.map(([id, content]) => ({
+				store_id: this.storeId,
+				document_id: id,
+				seq,
+				kind: content.kind,
+				version: content.version,
+				content: sql.typed(content.kind === "base" ? content.value : content.ops, 114),
+			}));
+			await sql`INSERT INTO document_revisions ${sql(rows, "store_id", "document_id", "seq", "kind", "version", "content")}`;
 		}
 	}
 }
@@ -806,8 +855,4 @@ function addressCondition(sql: postgres.ISql, address: DocumentAddress | Documen
 	return sql`md5(kind) = md5(${parts.kind}) AND kind = ${parts.kind} AND scope_kind = ${parts.scopeKind}
 		AND owner_id = ${parts.ownerId} AND family = ${parts.family}
 		AND md5(key_value) = md5(${parts.keyValue}) AND key_value = ${parts.keyValue}`;
-}
-
-function union(sql: postgres.ISql, branches: readonly postgres.PendingQuery<postgres.Row[]>[]) {
-	return branches.slice(1).reduce((combined, branch) => sql`${combined} UNION ALL ${branch}`, branches[0]!);
 }

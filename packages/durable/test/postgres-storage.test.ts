@@ -476,7 +476,8 @@ describe("PostgresStorage persistence and queries", () => {
 			await writer`UPDATE documents SET retired_at = 3, record = ${writer.typed({ id, kind: "snapshot", scope: { kind: "session" }, createdAt: 2, retiredAt: 3 }, 114)} WHERE id = ${id}`;
 			await writer`DELETE FROM document_revisions WHERE document_id = ${id}`;
 			await writer`COMMIT`;
-			expect((await read)?.value).toEqual({ retained: true });
+			// The single SELECT takes its snapshot after acquiring the blocked table lock.
+			expect(await read).toBeUndefined();
 			await closing;
 			expect(await (await open()).document(id, "current", context)).toBeUndefined();
 		} finally {
