@@ -15,7 +15,7 @@ afterEach(async () => {
 });
 
 /** Each test gets an isolated schema; the configured database must be a disposable test database. */
-export async function createPostgresDatabase() {
+export async function createPostgresDatabase(fallbackSchema?: string) {
 	const url = process.env.PI_DURABLE_POSTGRES_URL;
 	if (!url) throw new Error("Set PI_DURABLE_POSTGRES_URL to a local PostgreSQL test database");
 	const schema = `pi_storage_${randomUUID().replaceAll("-", "")}`;
@@ -25,7 +25,10 @@ export async function createPostgresDatabase() {
 	const clients = new Set<postgres.Sql>();
 	const connect = (applicationName = schema) => {
 		const client = postgres(url, {
-			connection: { search_path: schema, application_name: applicationName },
+			connection: {
+				search_path: fallbackSchema === undefined ? schema : `${schema},${fallbackSchema}`,
+				application_name: applicationName,
+			},
 			onnotice: () => {},
 		});
 		clients.add(client);

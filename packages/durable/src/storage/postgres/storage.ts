@@ -545,7 +545,7 @@ export class PostgresStorage implements Storage {
 		});
 		const rows = [...new Map(requested.map((row) => [row.id, { store_id: this.storeId, ...row }])).values()];
 		const existing = new Map<number, TableName>();
-		for (const batch of batches(rows, 3)) {
+		for (const batch of batches(rows, 3, 2)) {
 			// The SELECT sees pre-insert rows; data-modifying CTEs share its statement snapshot.
 			const previous = await sql<{ id: string; record_type: TableName }[]>`WITH claimed AS (
 				INSERT INTO record_ids ${sql(batch, "store_id", "id", "record_type")} ON CONFLICT DO NOTHING
@@ -838,9 +838,9 @@ export class PostgresStorage implements Storage {
 	}
 }
 
-// Postgres.js accepts at most 65,534 parameters per query.
-function* batches<T>(values: readonly T[], columns: number): Generator<readonly T[]> {
-	const size = Math.floor(65534 / columns);
+// Postgres.js rejects 65,534 or more parameters, including those outside the row batch.
+function* batches<T>(values: readonly T[], columns: number, extraParameters = 0): Generator<readonly T[]> {
+	const size = Math.floor((65533 - extraParameters) / columns);
 	for (let offset = 0; offset < values.length; offset += size) yield values.slice(offset, offset + size);
 }
 

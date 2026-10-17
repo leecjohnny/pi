@@ -123,7 +123,9 @@ export async function applyPostgresMigrations(
 	}
 
 	const currentVersion = migrations.at(-1)?.version ?? 0;
-	const [schema] = await database<{ present: boolean }[]>`SELECT to_regclass('durable_schema') IS NOT NULL AS present`;
+	const [schema] = await database<
+		{ present: boolean }[]
+	>`SELECT to_regclass(format('%I.durable_schema', current_schema())) IS NOT NULL AS present`;
 	if (schema?.present) {
 		const [row] = await database<SchemaRow[]>`SELECT version FROM durable_schema WHERE singleton = 1`;
 		if (row !== undefined && Number(row.version) === currentVersion) return;

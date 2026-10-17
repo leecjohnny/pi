@@ -11,8 +11,11 @@ import { type DocumentId, type EntryId, ROOT_CONVERSATION_ID } from "../src/type
 import { createPostgresDatabase } from "./postgres-fixture.ts";
 
 describe("durable PostgreSQL migrations", () => {
-	it("creates the current schema and can be applied repeatedly", async () => {
-		const { sql: database } = await createPostgresDatabase();
+	it("initializes the first search-path schema and can be applied repeatedly", async () => {
+		const fallback = await createPostgresDatabase();
+		await applyPostgresMigrations(fallback.sql);
+		await fallback.sql`UPDATE durable_metadata SET next_id = 42 WHERE store_id = 'default'`;
+		const { sql: database } = await createPostgresDatabase(fallback.schema);
 		await applyPostgresMigrations(database);
 		await applyPostgresMigrations(database);
 		expect((await database`SELECT version FROM durable_schema WHERE singleton = 1`)[0]).toEqual({
